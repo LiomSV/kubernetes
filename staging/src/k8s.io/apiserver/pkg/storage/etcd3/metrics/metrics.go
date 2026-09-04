@@ -183,12 +183,15 @@ func UpdateStoreStats(groupResource schema.GroupResource, stats storage.Stats, e
 	if err != nil {
 		objectCounts.WithLabelValues(groupResource.String()).Set(-1)
 		newObjectCounts.WithLabelValues(groupResource.Group, groupResource.Resource).Set(-1)
+		if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
+			resourceSizeEstimate.updateStoreStats(groupResource, stats, err)
+		}
 		return
 	}
 	objectCounts.WithLabelValues(groupResource.String()).Set(float64(stats.ObjectCount))
 	newObjectCounts.WithLabelValues(groupResource.Group, groupResource.Resource).Set(float64(stats.ObjectCount))
 	if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
-		resourceSizeEstimate.updateStoreStats(groupResource, stats)
+		resourceSizeEstimate.updateStoreStats(groupResource, stats, nil)
 	}
 }
 
@@ -339,9 +342,9 @@ type resourceSizeEstimateCollector struct {
 }
 
 type resourceEstimate struct {
-	groupResource schema.GroupResource
-	stats         storage.Stats
-	timestamp     time.Time
+	size      int64
+	timestamp time.Time
+	valid     bool
 }
 
 func newResourceSizeEstimateCollector() *resourceSizeEstimateCollector {
@@ -366,30 +369,41 @@ func (c *resourceSizeEstimateCollector) CollectWithStability(ch chan<- compbasem
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 
-	for _, estimate := range c.estimates {
-		c.collectResourceSizeEstimate(ch, estimate)
+	for gr, estimate := range c.estimates {
+		if !estimate.valid {
+			continue
+		}
+		ch <- compbasemetrics.NewLazyMetricWithTimestamp(
+			estimate.timestamp,
+			compbasemetrics.NewLazyConstMetric(
+				resourceSizeEstimateDesc,
+				compbasemetrics.GaugeValue,
+				float64(estimate.size),
+				gr.Group,
+				gr.Resource,
+			),
+		)
 	}
 }
 
-func (c *resourceSizeEstimateCollector) collectResourceSizeEstimate(ch chan<- compbasemetrics.Metric, s resourceEstimate) {
-	if s.stats.ObjectCount > 0 && s.stats.EstimatedAverageObjectSizeBytes == 0 {
-		return
-	}
-
-	ch <- compbasemetrics.NewLazyMetricWithTimestamp(s.timestamp,
-		compbasemetrics.NewLazyConstMetric(resourceSizeEstimateDesc, compbasemetrics.GaugeValue, float64(s.stats.EstimatedAverageObjectSizeBytes*s.stats.ObjectCount), s.groupResource.Group, s.groupResource.Resource))
-}
-
-func (c *resourceSizeEstimateCollector) updateStoreStats(gr schema.GroupResource, stats storage.Stats) {
-	if stats.ObjectCount > 0 && stats.EstimatedAverageObjectSizeBytes == 0 {
-		return
-	}
+func (c *resourceSizeEstimateCollector) updateStoreStats(gr schema.GroupResource, stats storage.Stats, err error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	if err != nil {
+		c.estimates[gr] = resourceEstimate{valid: false}
+		return
+	}
+
+	if stats.ObjectCount > 0 && stats.EstimatedAverageObjectSizeBytes == 0 {
+		c.estimates[gr] = resourceEstimate{valid: false}
+		return
+	}
+
 	c.estimates[gr] = resourceEstimate{
-		groupResource: gr,
-		stats:         stats,
-		timestamp:     now(),
+		size:      stats.EstimatedAverageObjectSizeBytes * stats.ObjectCount,
+		timestamp: now(),
+		valid:     true,
 	}
 }
 

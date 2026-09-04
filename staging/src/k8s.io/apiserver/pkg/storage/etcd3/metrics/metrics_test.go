@@ -448,7 +448,7 @@ apiserver_storage_objects{resource="bar2.foo2"} 20
 	}
 }
 
-func TestResourceSizeEstimateStaleCache(t *testing.T) {
+func TestResourceSizeEstimateInvalidation(t *testing.T) {
 	resourceSizeEstimate.ClearState()
 	defer func() {
 		resourceSizeEstimate.ClearState()
@@ -459,6 +459,7 @@ func TestResourceSizeEstimateStaleCache(t *testing.T) {
 
 	t1 := time.UnixMilli(1000000000000)
 	t2 := time.UnixMilli(2000000000000)
+	t3 := time.UnixMilli(3000000000000)
 	currentTime := t1
 	oldNow := now
 	defer func() {
@@ -479,22 +480,29 @@ apiserver_resource_size_estimate_bytes{group="foo",resource="bar"} 100 100000000
 		t.Fatal(err)
 	}
 
-	// Advance time and simulate a failed stats update. The metric should retain the original timestamp and value.
+	// Advance time and simulate a failed stats update. The metric should be invalidated and not emitted.
 	currentTime = t2
 	UpdateStoreStats(gr, storage.Stats{}, errors.New("failed to fetch stats"))
 
-	if err := testutil.GatherAndCompare(registry, strings.NewReader(wantT1), "apiserver_resource_size_estimate_bytes"); err != nil {
-		t.Fatalf("expected cached estimate with original timestamp to be preserved on error: %v", err)
+	if err := testutil.GatherAndCompare(registry, strings.NewReader(""), "apiserver_resource_size_estimate_bytes"); err != nil {
+		t.Fatalf("expected metric to be omitted on fetch error: %v", err)
 	}
 
-	// Successful update at t2 updates value and timestamp.
+	// Successful update at t3 updates value and timestamp.
+	currentTime = t3
 	UpdateStoreStats(gr, storage.Stats{ObjectCount: 20, EstimatedAverageObjectSizeBytes: 10}, nil)
-	wantT2 := `# HELP apiserver_resource_size_estimate_bytes [ALPHA] Estimated size of stored objects in database. Estimate is based on sum of last observed sizes of serialized objects.
+	wantT3 := `# HELP apiserver_resource_size_estimate_bytes [ALPHA] Estimated size of stored objects in database. Estimate is based on sum of last observed sizes of serialized objects.
 # TYPE apiserver_resource_size_estimate_bytes gauge
-apiserver_resource_size_estimate_bytes{group="foo",resource="bar"} 200 2000000000000
+apiserver_resource_size_estimate_bytes{group="foo",resource="bar"} 200 3000000000000
 `
-	if err := testutil.GatherAndCompare(registry, strings.NewReader(wantT2), "apiserver_resource_size_estimate_bytes"); err != nil {
+	if err := testutil.GatherAndCompare(registry, strings.NewReader(wantT3), "apiserver_resource_size_estimate_bytes"); err != nil {
 		t.Fatal(err)
+	}
+
+	// Update with ObjectCount > 0 and EstimatedAverageObjectSizeBytes == 0 should invalidate the metric.
+	UpdateStoreStats(gr, storage.Stats{ObjectCount: 5, EstimatedAverageObjectSizeBytes: 0}, nil)
+	if err := testutil.GatherAndCompare(registry, strings.NewReader(""), "apiserver_resource_size_estimate_bytes"); err != nil {
+		t.Fatalf("expected metric to be omitted when average size is 0: %v", err)
 	}
 }
 
