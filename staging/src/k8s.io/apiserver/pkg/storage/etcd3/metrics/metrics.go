@@ -80,14 +80,15 @@ var (
 		},
 		[]string{"resource"},
 	)
-	resourceSizeEstimate = compbasemetrics.NewGaugeVec(
-		&compbasemetrics.GaugeOpts{
-			Name:           "apiserver_resource_size_estimate_bytes",
-			Help:           "Estimated size of stored objects in database. Estimate is based on sum of last observed sizes of serialized objects. In case of a fetching error, the value will be -1.",
-			StabilityLevel: compbasemetrics.ALPHA,
-		},
+	resourceSizeEstimateDesc = compbasemetrics.NewDesc(
+		"apiserver_resource_size_estimate_bytes",
+		"Estimated size of stored objects in database. Estimate is based on sum of last observed sizes of serialized objects.",
 		[]string{"group", "resource"},
+		nil,
+		compbasemetrics.ALPHA,
+		"",
 	)
+	resourceSizeEstimate = newResourceSizeEstimateCollector()
 	newObjectCounts = compbasemetrics.NewGaugeVec(
 		&compbasemetrics.GaugeOpts{
 			Name:           "apiserver_resource_objects",
@@ -165,7 +166,7 @@ func Register() {
 		legacyregistry.MustRegister(etcdRequestCounts)
 		legacyregistry.MustRegister(etcdRequestErrorCounts)
 		legacyregistry.MustRegister(objectCounts)
-		legacyregistry.MustRegister(resourceSizeEstimate)
+		legacyregistry.CustomMustRegister(resourceSizeEstimate)
 		legacyregistry.MustRegister(newObjectCounts)
 		legacyregistry.CustomMustRegister(storageMonitor)
 		legacyregistry.MustRegister(etcdEventsReceivedCounts)
@@ -182,19 +183,12 @@ func UpdateStoreStats(groupResource schema.GroupResource, stats storage.Stats, e
 	if err != nil {
 		objectCounts.WithLabelValues(groupResource.String()).Set(-1)
 		newObjectCounts.WithLabelValues(groupResource.Group, groupResource.Resource).Set(-1)
-		if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
-			resourceSizeEstimate.WithLabelValues(groupResource.Group, groupResource.Resource).Set(-1)
-		}
 		return
 	}
 	objectCounts.WithLabelValues(groupResource.String()).Set(float64(stats.ObjectCount))
 	newObjectCounts.WithLabelValues(groupResource.Group, groupResource.Resource).Set(float64(stats.ObjectCount))
 	if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
-		if stats.ObjectCount > 0 && stats.EstimatedAverageObjectSizeBytes == 0 {
-			resourceSizeEstimate.WithLabelValues(groupResource.Group, groupResource.Resource).Set(-1)
-		} else {
-			resourceSizeEstimate.WithLabelValues(groupResource.Group, groupResource.Resource).Set(float64(stats.EstimatedAverageObjectSizeBytes * stats.ObjectCount))
-		}
+		resourceSizeEstimate.updateStoreStats(groupResource, stats)
 	}
 }
 
@@ -203,7 +197,7 @@ func DeleteStoreStats(groupResource schema.GroupResource) {
 	objectCounts.Delete(map[string]string{"resource": groupResource.String()})
 	newObjectCounts.Delete(map[string]string{"group": groupResource.Group, "resource": groupResource.Resource})
 	if utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
-		resourceSizeEstimate.DeleteLabelValues(groupResource.Group, groupResource.Resource)
+		resourceSizeEstimate.deleteStoreStats(groupResource)
 	}
 }
 
@@ -245,6 +239,7 @@ func RecordDecodeError(groupResource schema.GroupResource) {
 // Reset resets the etcd_request_duration_seconds metric.
 func Reset() {
 	etcdRequestLatency.Reset()
+	resourceSizeEstimate.Reset()
 }
 
 // sinceInSeconds gets the time since the specified start in seconds.
@@ -253,6 +248,11 @@ func Reset() {
 var sinceInSeconds = func(start time.Time) float64 {
 	return time.Since(start).Seconds()
 }
+
+// now returns the current time.
+//
+// This is a variable to facilitate testing.
+var now = time.Now
 
 // SetStorageMonitorGetter sets monitor getter to allow monitoring etcd stats.
 func SetStorageMonitorGetter(getter func() ([]Monitor, error)) {
@@ -330,6 +330,81 @@ func (c *monitorCollector) CollectWithStability(ch chan<- compbasemetrics.Metric
 		ch <- metric
 	}
 }
+
+type resourceSizeEstimateCollector struct {
+	compbasemetrics.BaseStableCollector
+
+	lock      sync.RWMutex
+	estimates map[schema.GroupResource]resourceEstimate
+}
+
+type resourceEstimate struct {
+	groupResource schema.GroupResource
+	stats         storage.Stats
+	timestamp     time.Time
+}
+
+func newResourceSizeEstimateCollector() *resourceSizeEstimateCollector {
+	return &resourceSizeEstimateCollector{
+		estimates: make(map[schema.GroupResource]resourceEstimate),
+	}
+}
+
+// Check if resourceSizeEstimateCollector implements necessary interface
+var _ compbasemetrics.StableCollector = &resourceSizeEstimateCollector{}
+
+// DescribeWithStability implements compbasemetrics.StableCollector
+func (c *resourceSizeEstimateCollector) DescribeWithStability(ch chan<- *compbasemetrics.Desc) {
+	ch <- resourceSizeEstimateDesc
+}
+
+// CollectWithStability implements compbasemetrics.StableCollector
+func (c *resourceSizeEstimateCollector) CollectWithStability(ch chan<- compbasemetrics.Metric) {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.SizeBasedListCostEstimate) {
+		return
+	}
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	for _, estimate := range c.estimates {
+		c.collectResourceSizeEstimate(ch, estimate)
+	}
+}
+
+func (c *resourceSizeEstimateCollector) collectResourceSizeEstimate(ch chan<- compbasemetrics.Metric, s resourceEstimate) {
+	if s.stats.ObjectCount > 0 && s.stats.EstimatedAverageObjectSizeBytes == 0 {
+		return
+	}
+
+	ch <- compbasemetrics.NewLazyMetricWithTimestamp(s.timestamp,
+		compbasemetrics.NewLazyConstMetric(resourceSizeEstimateDesc, compbasemetrics.GaugeValue, float64(s.stats.EstimatedAverageObjectSizeBytes*s.stats.ObjectCount), s.groupResource.Group, s.groupResource.Resource))
+}
+
+func (c *resourceSizeEstimateCollector) updateStoreStats(gr schema.GroupResource, stats storage.Stats) {
+	if stats.ObjectCount > 0 && stats.EstimatedAverageObjectSizeBytes == 0 {
+		return
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.estimates[gr] = resourceEstimate{
+		groupResource: gr,
+		stats:         stats,
+		timestamp:     now(),
+	}
+}
+
+func (c *resourceSizeEstimateCollector) deleteStoreStats(gr schema.GroupResource) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	delete(c.estimates, gr)
+}
+
+func (c *resourceSizeEstimateCollector) Reset() {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.estimates = make(map[schema.GroupResource]resourceEstimate)
+}
+
 
 // OperationLatencyTracker is a pre-materialized tracker for etcd request latency and request/error counters.
 type OperationLatencyTracker struct {
